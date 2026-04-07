@@ -10,20 +10,22 @@ import pdfplumber
 from docx import Document
 import openpyxl
 
-
+# Load environment variables
 load_dotenv()
 
+# Cached OpenAI client
 @st.cache_resource
 def get_client(api_key: str):
     return OpenAI(api_key=api_key)
 
+# Persistent Chroma DB client
 @st.cache_resource
 def get_chroma():
     return chromadb.PersistentClient(path=".chroma_db")
 
 chroma_client = get_chroma()
 
-
+# UI reset helper (clears inputs)
 def reset_ui():
     keys_to_clear = [
         "chat_input",
@@ -35,15 +37,17 @@ def reset_ui():
         if key in st.session_state:
             del st.session_state[key]
 
-
+# Normalize company/project names
 def normalize(name: str):
     return name.strip().lower().replace(" ", "_")
 
+
+# Get or create company collection in Chroma
 def get_company_collection(company_id: str):
     safe_name = f"company_{normalize(company_id)}"
     return chroma_client.get_or_create_collection(name=safe_name)
 
-
+# File readers (PDF, DOCX, Excel, TXT)
 def read_pdf(file):
     text = ""
     with pdfplumber.open(file) as pdf:
@@ -68,6 +72,8 @@ def read_excel(file):
 
     return text
 
+
+# Read multiple uploaded files
 def read_files(files):
     all_text = []
 
@@ -87,11 +93,13 @@ def read_files(files):
 
     return "\n\n".join(all_text)
 
+# Split text into chunks for embedding
 def split_text(text, size=400):
     words = text.split()
     return [" ".join(words[i:i+size]) for i in range(0, len(words), size)]
 
 
+# Create embeddings using OpenAI
 def embed(client, texts):
     res = client.embeddings.create(
         model="text-embedding-3-small",
@@ -99,6 +107,7 @@ def embed(client, texts):
     )
     return [r.embedding for r in res.data]
 
+# Store chunks + embeddings in Chroma
 def store_chunks(collection, project, chunks, client):
     embeddings = embed(client, chunks)
     ids = [str(uuid.uuid4()) for _ in chunks]
@@ -110,7 +119,7 @@ def store_chunks(collection, project, chunks, client):
         metadatas=[{"project": project} for _ in chunks]
     )
 
-
+# Retrieve relevant chunks from vector DB
 def retrieve(collection, project, client, query, k=8):
     query_embedding = embed(client, [query])[0]
 
@@ -122,7 +131,7 @@ def retrieve(collection, project, client, query, k=8):
 
     return results["documents"][0] if results["documents"] else []
 
-
+# Generate final answer using retrieved context
 def answer(client, question, context):
     prompt = f"""
 You are a document assistant.
@@ -144,9 +153,9 @@ QUESTION:
 
     return res.output[0].content[0].text
 
-
+# Main Streamlit app
 def main():
-    st.title("🏢 Multi-Company AI SaaS (Clean Reset Version)")
+    st.title("🏢 Construction AI Bot")
 
     api_key = st.sidebar.text_input("OpenAI API Key", type="password")
     if not api_key:
@@ -155,43 +164,67 @@ def main():
 
     client = get_client(api_key)
 
-
+    # COMPANY MANAGEMENT SECTION
     st.sidebar.header("🏢 Company")
 
     all_collections = chroma_client.list_collections()
+
     companies = [
         c.name.replace("company_", "")
         for c in all_collections
-        if c.name.startswith("company_")
+        if c.name.startswith("company_") and c.name != "company_"
     ]
+
+    # FIX: ensure company state always exists BEFORE usage
+    if "company" not in st.session_state:
+        st.session_state["company"] = None
 
     new_company = st.sidebar.text_input("Create / Enter Company", key="company_input")
 
     if st.sidebar.button("➕ Set Company"):
         if new_company.strip():
-            st.session_state["company"] = normalize(new_company)
+            normalized = normalize(new_company)
+
+            # IMPORTANT FIX: actually create collection immediately
+            get_company_collection(normalized)
+
+            st.session_state["company"] = normalized
             reset_ui()
             st.rerun()
 
+    # FIX: keep dropdown stable and safe
+    safe_companies = sorted(list(set(companies))) if companies else []
+
     selected_company = st.sidebar.selectbox(
         "Select Company",
-        companies if companies else ["No companies yet"],
+        safe_companies if safe_companies else ["No companies yet"],
         key="company_select"
     )
 
     if selected_company != "No companies yet":
-        if st.session_state.get("company") != normalize(selected_company):
-            st.session_state["company"] = normalize(selected_company)
+        normalized_selected = normalize(selected_company)
+
+        if st.session_state.get("company") != normalized_selected:
+            st.session_state["company"] = normalized_selected
             reset_ui()
             st.rerun()
 
-    if "company" not in st.session_state:
-        st.session_state["company"] = normalize(selected_company)
-
     company = st.session_state["company"]
-    st.sidebar.success(f"Active Company: {company}")
 
+    # FIX: safety check so UI doesn't crash
+    if company:
+        st.sidebar.success(f"Active Company: {company}")
+    else:
+        st.sidebar.warning("No company selected")
 
+    # FIX: prevent crash when no company exists
+    if not company:
+        st.stop()
+
+    # FIX: collection must be created AFTER company is guaranteed
+    collection = get_company_collection(company)
+
+    # PROJECT MANAGEMENT SECTION
     def get_projects():
         data = collection.get(include=["metadatas"])
         metas = data.get("metadatas", [])
@@ -199,8 +232,6 @@ def main():
         return sorted(list(set(
             m["project"] for m in metas if m and "project" in m
         )))
-
-    collection = get_company_collection(company)
 
     st.sidebar.header("📁 Project")
 
@@ -232,7 +263,7 @@ def main():
     project = st.session_state["project"]
     st.sidebar.success(f"Active Project: {project}")
 
-
+    # FILE UPLOAD + INDEXING SECTION
     files = st.sidebar.file_uploader(
         "Upload Documents",
         accept_multiple_files=True,
@@ -250,12 +281,14 @@ def main():
 
             st.success(f"Indexed {len(chunks)} chunks")
 
+    # CHAT MEMORY SETUP
     if "chat" not in st.session_state:
         st.session_state.chat = []
 
     for msg in st.session_state.chat:
         st.chat_message(msg["role"]).write(msg["text"])
 
+    # CHAT INPUT + RAG FLOW
     prompt = st.chat_input("Ask something...", key="chat_input")
 
     if prompt:
@@ -271,6 +304,7 @@ def main():
         st.session_state.chat.append({"role": "user", "text": prompt})
         st.session_state.chat.append({"role": "assistant", "text": reply})
 
+#START APP
 if __name__ == "__main__":
     main()
 
